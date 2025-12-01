@@ -89,7 +89,6 @@ class MultiHeadedAttention(nn.Module):
             mask = mask.unsqueeze(1)
 
         nbatches = query.size(0)
-
         # 1) Do all the linear projections in batch from d_model => h x d_k
         query, key, value = \
                     [l(x).view(nbatches, -1, self.n_heads, self.d_k).transpose(1, 2)
@@ -160,9 +159,22 @@ class src_2Dembeddings(nn.Module):
 
         self.position = PositionalEncoding(n_units, 0.3)
 
+        if self.network_type == 'vit':
+            # Load a pre-trained ViT model
+            self.network = torchvision.models.vit_b_16(pretrained=pretrained)
+            
+            # Adjust the model to work with a different number of input channels if necessary
+            if channels != 3:
+                self.network.conv_proj = nn.Conv2d(channels, self.network.conv_proj.out_channels, 
+                                                   kernel_size=self.network.conv_proj.kernel_size, 
+                                                   stride=self.network.conv_proj.stride, 
+                                                   padding=self.network.conv_proj.padding)
+
         #Use mb2 for image embeddings
         #TO DO: customize other arch to make them able train on grayscale
-        if(self.network_type=='mb2'):
+        elif(self.network_type == 'convnext'):
+            self.network = torchvision.models.convnext_base(pretrained=True)
+        elif(self.network_type=='mb2'):
             #self.network = torchvision.models.mobilenet_v2(pretrained=pretrained)
             self.network = mb2.mobilenet_v2(channels=channels, pretrained=pretrained)
 
@@ -191,9 +203,14 @@ class src_2Dembeddings(nn.Module):
             print('No supported architecture!!')
             quit(0)
 
-        #Drop FC layer
-        modules = list(self.network.children())[:-1]
-        self.network = nn.Sequential(*modules)
+        # Drop the classification head (last layer) for ViT
+        if self.network_type == 'vit':
+            self.network.heads = nn.Identity()  # Removes the classification head
+
+        # Drop the classification layer for CNN architectures
+        else:
+            modules = list(self.network.children())[:-1]
+            self.network = nn.Sequential(*modules)
 
         #Placeholder for gradients
         self.gradients = None
@@ -214,18 +231,21 @@ class src_2Dembeddings(nn.Module):
         feature_map = self.network(x)
         #print(feature_map.size())
 
-        #register the hook
-        #if(feature_map.requires_grad):
-            #print('here')
-         #   feature_map.register_hook(self.activations_hook)
-            #sd
+        # For ViT, the feature map is already 1D
+        if self.network_type == 'vit':
+            frame_embeddings = feature_map
+        else:
+            # Apply AVG POOL if we have a feature map
+            if len(feature_map.shape) > 2:
+                frame_embeddings = feature_map.mean(3).mean(2)
+            else:
+                frame_embeddings = feature_map
 
-        #Apply AVG POOL if we have a feature map
-        if(len(feature_map.shape) > 2):
-            frame_embeddings =  feature_map.mean(3).mean(2)
-
-        #Reshape embeddings as expected from transformer block
-        frame_embeddings = frame_embeddings.view(batch_size, -1, self.n_units)
+        if self.network_type == 'vit':
+            #Reshape embeddings as expected from transformer block
+            frame_embeddings = frame_embeddings.reshape(batch_size, -1, self.n_units)
+        else:
+            frame_embeddings = frame_embeddings.view(batch_size, -1, self.n_units)
 
         #image emb = (batch, seq_length, n_units)
         return frame_embeddings, feature_map, self.gradients
@@ -484,6 +504,3 @@ class PositionWise(nn.Module):
     def forward(self, x):
         return self.w_2(self.dropout(F.relu(self.w_1(x))))
         #return self.w_2(self.dropout(self.activation(self.w_1(x))))
-
-
-
