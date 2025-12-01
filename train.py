@@ -6,11 +6,14 @@ import torch.nn
 from torch.autograd import Variable
 import torch.nn.functional as F
 import torch.nn as nn
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 import numpy as np
 import pandas as pd
 import json
 import datetime as dt
 from torch.optim.lr_scheduler import StepLR, MultiStepLR
+from accelerate.utils import write_basic_config
 #Progress bar to visualize training progress
 import progressbar
 import matplotlib.pyplot as plt
@@ -37,6 +40,7 @@ parser.add_argument('--remove_bg_training',type=bool, default= False)
 
 parser.add_argument('--remove_bg_test',type=bool, default= False)
 
+parser.add_argument("--local-rank", type=int, default=0)
 
 parser.add_argument('--fixed_padding', type=int, default=None,
                     help='None/64')
@@ -67,7 +71,7 @@ parser.add_argument('--show_sample', action='store_true',
 parser.add_argument('--optimizer', type=str, default='ADAM',
                     help='optimization algo to use; SGD, SGD_LR_SCHEDULE, ADAM / NOAM')
 
-parser.add_argument('--scheduler', type=str, default=None,
+parser.add_argument('--scheduler', type=str, default='multi-step',
                     help='Type of scheduler, multi-step or stepLR')
 
 parser.add_argument('--milestones', default="15,30", type=str,
@@ -143,10 +147,7 @@ parser.add_argument('--rel_window', type=int, default=None,
                     help="Use local masking window.")
 
 #Training settings
-parser.add_argument('--parallel', action='store_true',
-                    help='Training on multiple GPUs if available by splitting batches!')
-
-parser.add_argument('--distributed', action='store_true',
+parser.add_argument('--distributed', default=False,
                     help='Training on multiple GPUs if available by splitting submodules!')
 
 parser.add_argument('--freeze_cnn', default= False,
@@ -176,8 +177,12 @@ args = parser.parse_args()
 #Set the random seed manually for reproducibility.
 torch.manual_seed(args.seed)
 
+# Use a unique identifier based on the process rank
+# Assuming you have defined local_rank somewhere in your code
+# You can get the local_rank from command-line arguments or environment variables
+local_rank = args.local_rank if 'local_rank' in args else 0  # Adjust accordingly
 #experiment_path = PureWindowsPath('EXPERIMENTATIONS\\' + start_date)
-experiment_path = os.path.join(args.save_dir,start_date)
+experiment_path = os.path.join(args.save_dir,f"{start_date}_rank_{local_rank}")
 
 # Creates an experimental directory and dumps all the args to a text file
 if(os.path.exists(experiment_path)):
@@ -197,15 +202,27 @@ with open (os.path.join(experiment_path,'exp_config.txt'), 'w') as f:
         f.write(arg+' : '+str(getattr(args, arg))+'\n')
 
 #-------------------------------------------------------------------------------
-#Run on GPU
+def cleanup():
+    dist.destroy_process_group()
+
 if torch.cuda.is_available():
-    print('Nmber of GPUs={}',torch.cuda.device_count())
-    print('Device name:{}',torch.cuda.get_device_name(0))
-    device = torch.device("cuda:0")
+    # Get the local rank from environment variable (for each process)
+    #local_rank = int(os.environ["LOCAL_RANK"])
+    #local_rank = args.local_rank  # Get local_rank from command-line args
+    local_rank = int(os.environ['LOCAL_RANK'])
+    print(f"Number of GPUs: {torch.cuda.device_count()}")
+    print(f"Using GPU: {local_rank} -> {torch.cuda.get_device_name(local_rank)}")
+
+    # Set the device for this process using the local rank
+    #device = torch.device(f"cuda:{local_rank}")
+    dist.init_process_group(backend="nccl")
+    torch.cuda.set_device(local_rank)  # Make sure the correct GPU is used by this process
+    device = local_rank
 else:
-#Run on CPU
-    print("WARNING: Training on CPU, this will likely run out of memory, Go buy yourself a GPU!")
+    # Run on CPU if no GPUs are available
+    print("WARNING: Training on CPU. This will likely run out of memory. Go buy yourself a GPU!")
     device = torch.device("cpu")
+
 #--------------------------------------------------------------------------------
 
 
@@ -312,6 +329,7 @@ def run_epoch(model, data, is_train=False, device='cuda:0', n_devices=1):
     else:
         print(f"Average Validation Loss: {avg_loss:.4f}, Average Validation Accuracy: {avg_accuracy:.4f}")
 
+
     return avg_loss, avg_accuracy
 #-------------------------------------------------------------------------------------------------------
 
@@ -355,6 +373,7 @@ if(args.hand_stats):
 train_dataloader, train_size = loader(csv_file=train_csv,
                 root_dir=args.data,
                 lookup_table=lookup_table,
+                local_rank=local_rank,
                 remove_bg=args.remove_bg_training,
                 rescale = args.rescale,
                 batch_size = batch_size,
@@ -374,6 +393,7 @@ train_dataloader, train_size = loader(csv_file=train_csv,
 valid_dataloader, valid_size = loader(csv_file=val_csv,
                 root_dir=args.data,
                 lookup_table=lookup_table,
+                local_rank=local_rank,
                 remove_bg=args.remove_bg_test,
                 rescale = args.rescale,
                 batch_size = args.batch_size,
@@ -400,48 +420,11 @@ print(dataset_sizes)
 #Load the whole model
 model = TRANSFORMER(num_classes=args.num_classes, n_stacks=args.num_layers, n_units=args.hidden_size, n_heads=args.n_heads ,d_ff=args.d_ff, dropout=1.-args.dp_keep_prob, image_size=args.rescale, pretrained=args.pretrained,
                             classifier_hidden_dim= args.classifier_hidden_size,emb_type=args.emb_type, emb_network=args.emb_network, full_pretrained=args.full_pretrained, hand_pretrained=args.hand_pretrained, freeze_cnn=args.freeze_cnn, channels=channels)
+
+
 trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 print('model parameters:',trainable_params)
-
-if torch.cuda.device_count() > 1 and args.parallel:
-    #How many GPUs you are using
-    n_devices = torch.cuda.device_count()
-
-
-    if(args.distributed):
-        #Split GPUs for both feature extraction and sequence learning (Transformer)
-        n_devices_split = int(n_devices/2)
-        print("Using ", n_devices_split, "GPUs for feature extraction and ", n_devices-n_devices_split, "GPUs for sequence learning.")
-
-        devices = list(range(0, n_devices_split))
-        feature_extractor = nn.DataParallel(model.src_emb, device_ids=devices).to(device)
-
-        if(args.hand_query):
-             hand_extractor = nn.DataParallel(model.hand_emb, device_ids=devices).to(device)
-
-        devices = list(range(n_devices_split, n_devices))
-
-        encoder = nn.DataParallel(model.encoder, device_ids=devices).to(n_devices_split)
-        position = nn.DataParallel(model.position, device_ids=devices).to(n_devices_split)
-        output_layer = nn.DataParallel(model.output_layer, device_ids=devices).to(n_devices_split)
-
-    else:
-        print("Using ", n_devices, "GPUs!, Let's GO!")
-        model = nn.DataParallel(model).to(device)
-else:
-    print("Training using 1 device (GPU/CPU), use very small batch_size!")
-    #Load model into device (GPU OR CPU)
-    n_devices = 1
-    model = model.to(device)
-
-    if(args.distributed):
-        print("Can't use distributed training since you have a single GPU!")
-        quit(0)
-
-
-#print("Loading to GPUs")
-#print(GPUtil.showUtilization())
 
 train_ppls = []
 train_losses = []
@@ -492,7 +475,43 @@ if(args.checkpoint == None or args.resume == False):
     else:
         print('No scheduler!')
 
+if torch.cuda.device_count() > 1:
+    #How many GPUs you are using
+    n_devices = torch.cuda.device_count()
 
+
+    if(args.distributed):
+        #Split GPUs for both feature extraction and sequence learning (Transformer)
+        n_devices_split = int(n_devices/2)
+        print("Using ", n_devices_split, "GPUs for feature extraction and ", n_devices-n_devices_split, "GPUs for sequence learning.")
+
+        devices = list(range(0, n_devices_split))
+        feature_extractor = nn.DataParallel(model.src_emb, device_ids=devices).to(device)
+
+        if(args.hand_query):
+             hand_extractor = nn.DataParallel(model.hand_emb, device_ids=devices).to(device)
+
+        devices = list(range(n_devices_split, n_devices))
+
+        encoder = nn.DataParallel(model.encoder, device_ids=devices).to(n_devices_split)
+        position = nn.DataParallel(model.position, device_ids=devices).to(n_devices_split)
+        output_layer = nn.DataParallel(model.output_layer, device_ids=devices).to(n_devices_split)
+
+    else:
+        print("Using ", n_devices, "GPUs!, Let's GO!")
+        #model = nn.DataParallel(model).to(device)
+        model = model.to(local_rank)
+        #local_rank = int(os.environ["LOCAL_RANK"])
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+else:
+    print("Training using 1 device (GPU/CPU), use very small batch_size!")
+    #Load model into device (GPU OR CPU)
+    n_devices = 1
+    model = model.to(device)
+
+    if(args.distributed):
+        print("Can't use distributed training since you have a single GPU!")
+        quit(0)
 ###
 #Main Training loop
 best_accuracy_so_far = 0
@@ -505,24 +524,26 @@ for epoch in range(start_epoch, num_epochs):
     #print('LR',scheduler.get_lr())
     print(optimizer.param_groups[0]['lr'])
     # RUN MODEL ON TRAINING DATA
-    train_loss, train_accuracy = run_epoch(model, train_dataloader, True, device=device)
+    train_loss, train_accuracy = run_epoch(model, train_dataloader, True, device=local_rank)
     print("After train epoch..")
     print(GPUtil.showUtilization())
 
     #Save perplexity
     train_ppl = np.exp(train_loss)
 
-    if(args.scheduler):
-        scheduler.step()
+    # if(args.scheduler):
+    #     scheduler.step()
     
     if(epoch % args.valid_steps == 0):
 
         #RUN MODEL ON VALIDATION DATA
         #NOTE: Helps with avoiding memory saturation
         with torch.no_grad():
-            val_loss, val_accuracy = run_epoch(model, valid_dataloader)
+            val_loss, val_accuracy = run_epoch(model, valid_dataloader, False, device=local_rank)
+
 
             if val_accuracy > best_accuracy_so_far:
+                torch.distributed.barrier()  # Synchronize all ranks before saving
                 best_accuracy_so_far = val_accuracy
 
                 #if args.save_best:
@@ -534,10 +555,10 @@ for epoch in range(start_epoch, num_epochs):
                 'loss': val_loss,
                 'best_accuracy': best_accuracy_so_far
                 },
-                os.path.join(args.save_dir, 'BEST.pt'))
+                os.path.join(experiment_path, 'BEST.pt'))
 
                 print("Saving full-frame (CNN) with best params")
-                torch.save(model.src_emb.state_dict(), os.path.join(args.save_dir, 'full_cnn_best_params.pt'))
+                torch.save(model.module.src_emb.state_dict(), os.path.join(experiment_path, 'full_cnn_best_params.pt'))
 
                 if(args.hand_query):
                     print("Saving hand regions (CNN) with best params")
@@ -565,12 +586,12 @@ for epoch in range(start_epoch, num_epochs):
 
         print(log_str)
 
-        with open (os.path.join(args.save_dir, 'log.txt'), 'a') as f_:
+        with open (os.path.join(experiment_path, 'log.txt'), 'a') as f_:
                 f_.write(log_str+ '\n')
 
 
         #SAVE LEARNING CURVES
-        lc_path = os.path.join(args.save_dir, 'learning_curves.npy')
+        lc_path = os.path.join(experiment_path, 'learning_curves.npy')
         print('\nDONE\n\nSaving learning curves to '+lc_path)
         np.save(lc_path, {'train_ppls':train_ppls,
                   'val_ppls':val_ppls,
@@ -580,11 +601,12 @@ for epoch in range(start_epoch, num_epochs):
                   })
 
         print("Saving plots")
-        learning_curve_slr(args.save_dir)
+        learning_curve_slr(experiment_path)
 
         #Save every model every 10 epoch
         if(epoch % args.save_steps == 0):
             #Save after each epoch and save optimizer state
+            torch.distributed.barrier()  # Synchronize all ranks before saving
             print("Saving model parameters for epoch: "+str(epoch))
             torch.save({
                 'epoch': epoch,
@@ -593,10 +615,12 @@ for epoch in range(start_epoch, num_epochs):
                 'loss': loss_fn,
                 'best_accuracy': best_accuracy_so_far
                 },
-                os.path.join(args.save_dir, 'epoch_'+str(epoch)+'_accuracy_'+str(val_accuracy)+'.pt'))
+                os.path.join(experiment_path, 'epoch_'+str(epoch)+'_accuracy_'+str(val_accuracy)+'.pt'))
 
 
         #We reached convergence
         if(train_ppl <= 1):
             print("Hello World ;)")
             break
+
+cleanup()
